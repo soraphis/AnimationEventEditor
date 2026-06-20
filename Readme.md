@@ -30,6 +30,7 @@ Unity's builtin animation panel would show these animatios in a "(Read-Only)" st
 - Project shared Favorites Panel, to quickly jump between files
 - Supports multiple Clips per Model
 - Add a `Prefab` of your game object into the "Ref:" field, to show a preview of your mesh + nice function selector
+- creates a visually distinct line per function and groupes them based on that. Also automatically tries to reduce overlap by using a second line if parameter names are too close.
 
 # Installation
 
