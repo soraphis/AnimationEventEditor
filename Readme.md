@@ -46,8 +46,13 @@ https://github.com/soraphis/UnityStateTree.git
 
 This project was created with heavy AI assistance.
 
-# Inspirations
+## Inspirations
 - https://assetstore.unity.com/packages/tools/animation/better-animation-events-329232
   - This asset is a great inspiration for this project. But it does not add the events to the Import Settings but promotes copy-based workflows.
 - https://www.fab.com/listings/14d8cc38-e39f-494e-9e33-bfc37094b10c
   - Looked pretty unfinished and not ergonomic.
+
+## License
+
+The LPGP v3.0 requires derived work to remain open source while still allowing usage in closed source projects.
+Since this is Editor Only code, nothing of it will ship with the final game.
