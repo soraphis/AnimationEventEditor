@@ -1,0 +1,17 @@
+{
+  "name": "com.soraphis.animation-event-editor",
+  "displayName": "Animation Event Editor",
+  "version": "0.1.0",
+  "unity": "6000.3",
+  "description": "A simple editor extension to edit animation events in a more user-friendly way.",
+  "keywords": [
+    "animation",
+    "event",
+    "editor",
+    "extension"
+  ],
+  "author": {
+    "name": "Soraphis"
+  },
+  "license": "MIT"
+}
