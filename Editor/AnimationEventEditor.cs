@@ -82,10 +82,20 @@ namespace AnimationEventEditor
         // --- Timeline ------------------------------------------------------------
         private Vector2 timelineScroll;
         private float zoom = 1f;
-        private float FrameWidth => 14f * zoom;
+        private const float BaseFrameWidth = 14f;
+        private const float MinZoom = 0.1f;
+        private const float MaxZoom = 16f;
+        private float FrameWidth => BaseFrameWidth * zoom;
         private const float TimelineBorder = 30f;
         private const float TickRowHeight = 22f;
         private const float FunctionRowHeight = 36f;   // tall enough for two sub-rows
+        private static readonly int[] NiceTickSteps = { 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000 };
+
+        private float timelineViewWidth;
+        private float timelineContentW;
+        private bool isPanning;
+        private float lastDragViewX;
+        private bool lastDragSnap;
 
         // Event dragging
         private bool isDraggingEvent;
@@ -95,6 +105,26 @@ namespace AnimationEventEditor
         private bool isPreviewSceneInited;
         private GameObject previewSceneObject;
         private PreviewRenderUtility _previewUtility;
+
+        private const string PrefPreviewVisible = "FbxAnimEventEditor.previewVisible";
+        private const string PrefPreviewSize = "FbxAnimEventEditor.previewSize";
+        private const float PreviewFov = 30f;
+        private const float DefaultPreviewPitch = 20f;
+        private const float MinPreviewSize = 170f;
+        private const float PreviewMargin = 12f;
+        private const float PreviewGripSize = 14f;
+        private const float TimelineHintH = 16f;
+
+        private bool previewVisible = true;
+        private float previewSize = 240f;
+        private float previewYaw;
+        private float previewPitch = DefaultPreviewPitch;
+        private float previewZoom = 1f;
+        private float previewRadius = 1f;
+        private Vector3 previewCenter = Vector3.up;
+        private bool previewPlaying;
+        private bool previewLoop = true;
+        private double lastUpdateTime;
         
         // --- Reference object / method discovery ---------------------------------
         private GameObject referenceObject;
@@ -132,6 +162,7 @@ namespace AnimationEventEditor
 
         // --- GUIStyles -------------------------------------------------------------
         private GUIStyle dropDownWithSmallText = null;
+        private GUIStyle previewHintStyle = null;
         
         // --- Menu -----------------------------------------------------------------
         [MenuItem("Window/Animation/Animation Events")]
@@ -146,7 +177,12 @@ namespace AnimationEventEditor
         private void OnEnable()
         {
             Selection.selectionChanged += OnSelectionChanged;
+            EditorApplication.update += OnEditorUpdate;
+            lastUpdateTime = EditorApplication.timeSinceStartup;
             dropDownWithSmallText = null;
+            previewHintStyle = null;
+            previewVisible = EditorPrefs.GetBool(PrefPreviewVisible, true);
+            previewSize = EditorPrefs.GetFloat(PrefPreviewSize, 240f);
             
             RefreshClipInfo();
             InitPreviewScene();
@@ -179,6 +215,35 @@ namespace AnimationEventEditor
             dropDownWithSmallText.active = EditorStyles.toolbarDropDown.active;
             dropDownWithSmallText.focused = EditorStyles.toolbarDropDown.focused;
             dropDownWithSmallText.onHover = EditorStyles.toolbarDropDown.onHover;
+
+            previewHintStyle ??= new GUIStyle(EditorStyles.miniLabel)
+            {
+                alignment = TextAnchor.MiddleRight,
+                normal = { textColor = new Color(1f, 1f, 1f, 0.45f) },
+            };
+        }
+
+        private void OnEditorUpdate()
+        {
+            double now = EditorApplication.timeSinceStartup;
+            float deltaTime = (float)(now - lastUpdateTime);
+            lastUpdateTime = now;
+
+            if (!previewPlaying || clipLength <= 0f) return;
+
+            float time = currentTimeScrubberTime + deltaTime;
+            if (time >= clipLength)
+            {
+                if (previewLoop) time %= clipLength;
+                else
+                {
+                    time = clipLength;
+                    previewPlaying = false;
+                }
+            }
+            currentTimeScrubberTime = time;
+            if (!isScrubberDragging && !isDraggingEvent) EnsureTimeVisible(time);
+            Repaint();
         }
         
         private void InitPreviewScene()
@@ -198,15 +263,7 @@ namespace AnimationEventEditor
             if (selectedModel != null && model != null)
             {
                 _previewUtility = new PreviewRenderUtility(true);
-                float distance = 10f;
-                Quaternion camRotation = Quaternion.Euler(20, 0, 0);
-                Vector3 camPosition = new Vector3(0, 0, 2) + camRotation * new Vector3(0, 0, -distance);
-
-                _previewUtility.camera.transform.position = camPosition;
-                _previewUtility.camera.transform.rotation = camRotation;
-                
-                // 2. Set up the camera properties
-                _previewUtility.camera.fieldOfView = 30f;
+                _previewUtility.camera.fieldOfView = PreviewFov;
                 _previewUtility.camera.nearClipPlane = 0.01f;
                 _previewUtility.camera.farClipPlane = 1000f;
 
@@ -226,11 +283,50 @@ namespace AnimationEventEditor
                 previewSceneObject.hideFlags = HideFlags.HideAndDontSave;
                 
                 if(previewClip != null) previewClip.SampleAnimation(previewSceneObject, currentTimeScrubberTime);
-                
-
-                // Camera is spawned at origin, so position is in front of the cube.
+                FramePreviewCamera();
+                ResetPreviewCamera();
                 isPreviewSceneInited = true;
             }
+        }
+
+        private void FramePreviewCamera()
+        {
+            Bounds bounds = default;
+            bool hasBounds = false;
+            foreach (var renderer in previewSceneObject.GetComponentsInChildren<Renderer>())
+            {
+                if (renderer is not (SkinnedMeshRenderer or MeshRenderer)) continue;
+                if (!hasBounds)
+                {
+                    bounds = renderer.bounds;
+                    hasBounds = true;
+                }
+                else bounds.Encapsulate(renderer.bounds);
+            }
+            if (!hasBounds) bounds = new Bounds(Vector3.up, Vector3.one * 2f);
+
+            previewCenter = bounds.center;
+            previewRadius = Mathf.Max(bounds.extents.magnitude, 0.1f);
+        }
+
+        private void ResetPreviewCamera()
+        {
+            previewYaw = 0f;
+            previewPitch = DefaultPreviewPitch;
+            previewZoom = 1f;
+            Repaint();
+        }
+
+        private void UpdatePreviewCamera(float aspect)
+        {
+            float halfVerticalFov = PreviewFov * 0.5f * Mathf.Deg2Rad;
+            float halfHorizontalFov = Mathf.Atan(Mathf.Tan(halfVerticalFov) * aspect);
+            float framedDistance = previewRadius * 1.1f / Mathf.Sin(Mathf.Min(halfVerticalFov, halfHorizontalFov));
+
+            Quaternion rotation = Quaternion.Euler(previewPitch, previewYaw, 0f);
+            Transform cameraTransform = _previewUtility.camera.transform;
+            cameraTransform.rotation = rotation;
+            cameraTransform.position = previewCenter - rotation * Vector3.forward * (framedDistance * previewZoom);
         }
 
         private GameObject testTarget;
@@ -238,6 +334,7 @@ namespace AnimationEventEditor
         private void OnDisable()
         {
             Selection.selectionChanged -= OnSelectionChanged;
+            EditorApplication.update -= OnEditorUpdate;
             // Persist panel widths that we only save on-change-end
             AnimationEventEditorPrefs.instance?.SavePrefs();
             AnimationEventProjectPrefs.instance?.SavePrefs();
@@ -1024,18 +1121,39 @@ namespace AnimationEventEditor
             GUILayout.Label("Timeline", EditorStyles.boldLabel, GUILayout.Width(70));
             GUILayout.Space(8);
             GUILayout.Label("Zoom", EditorStyles.miniLabel, GUILayout.Width(34));
-            zoom = GUILayout.HorizontalSlider(zoom, 0.1f, 8f, GUILayout.Width(90));
-            if (GUILayout.Button("Fit", EditorStyles.toolbarButton, GUILayout.Width(28)))
-                FitZoom(panelRect.width);
+            EditorGUI.BeginChangeCheck();
+            float logZoom = GUILayout.HorizontalSlider(Mathf.Log(zoom, 2f),
+                Mathf.Log(MinZoom, 2f), Mathf.Log(MaxZoom, 2f), GUILayout.Width(90));
+            if (EditorGUI.EndChangeCheck()) SetZoom(Mathf.Pow(2f, logZoom), panelRect.width * 0.5f);
+            if (GUILayout.Button(new GUIContent("Fit", "Fit whole clip"), EditorStyles.toolbarButton, GUILayout.Width(28)))
+                FrameRange(0f, clipLength);
+            if (GUILayout.Button(new GUIContent("Sel", "Frame selected event (F)"), EditorStyles.toolbarButton, GUILayout.Width(28)))
+                FrameSelection();
             GUILayout.FlexibleSpace();
             GUILayout.Label(
                 $"{workingEvents.Count} event{(workingEvents.Count == 1 ? "" : "s")}",
                 EditorStyles.miniLabel);
             GUILayout.Space(4);
+            bool showPreview = GUILayout.Toggle(previewVisible, "Preview", EditorStyles.toolbarButton, GUILayout.Width(56));
+            if (showPreview != previewVisible)
+            {
+                previewVisible = showPreview;
+                EditorPrefs.SetBool(PrefPreviewVisible, previewVisible);
+            }
             EditorGUILayout.EndHorizontal();
 
             float toolbarH  = EditorStyles.toolbar.fixedHeight;
-            float timelineH = panelRect.height - toolbarH;
+            float bodyH = panelRect.height - toolbarH;
+            float timelineW = panelRect.width;
+            float timelineH = Mathf.Max(40f, bodyH - TimelineHintH);
+            Rect hintRect = new(0, toolbarH + timelineH, timelineW, TimelineHintH);
+            timelineViewWidth = timelineW;
+
+            float maxPreviewSize = Mathf.Max(MinPreviewSize,
+                Mathf.Min(timelineW - PreviewMargin * 2f, timelineH - 18f - TickRowHeight));
+            float displayedPreviewSize = Mathf.Clamp(previewSize, MinPreviewSize, maxPreviewSize);
+            Rect previewRect = new(timelineW - displayedPreviewSize - PreviewMargin,
+                hintRect.y - displayedPreviewSize - 18f, displayedPreviewSize, displayedPreviewSize);
 
             // Build function groups in first-seen order so the layout stays stable
             // as events are added / removed.
@@ -1053,11 +1171,18 @@ namespace AnimationEventEditor
             }
 
             int rowCount    = Mathf.Max(1, functionOrder.Count);
-            float contentW  = Mathf.Max(frameCount * FrameWidth + TimelineBorder * 2f + 20f, panelRect.width + 1);
+            float contentW  = ContentWidth(timelineViewWidth);
+            timelineContentW = contentW;
             float contentH  = TickRowHeight + rowCount * FunctionRowHeight + 4f;
             float scrollH   = Mathf.Max(contentH + 16f, timelineH);
 
-            Rect scrollViewRect = new(0, toolbarH, panelRect.width, timelineH);
+            Rect scrollViewRect = new(0, toolbarH, timelineW, timelineH);
+            Event currentEvent = Event.current;
+            Vector2 savedMousePosition = currentEvent.mousePosition;
+            bool previewHovered = previewVisible && previewRect.Contains(savedMousePosition);
+            if (previewHovered) currentEvent.mousePosition = new Vector2(-10000f, -10000f);
+
+            HandleTimelineInput(scrollViewRect, contentH + 1f > timelineH);
             timelineScroll = GUI.BeginScrollView(
                 scrollViewRect, timelineScroll,
                 new Rect(0, 0, contentW, scrollH - 15f));
@@ -1091,7 +1216,7 @@ namespace AnimationEventEditor
                 for (int gi = 0; gi < functionOrder.Count; gi++)
                 {
                     string fn = functionOrder[gi];
-                    DrawFunctionRow(gi, fn, groupedIndices[fn], rowY, panelRect.width);
+                    DrawFunctionRow(gi, fn, groupedIndices[fn], rowY, contentW);
                     rowY += FunctionRowHeight;
                 }
             }
@@ -1102,38 +1227,280 @@ namespace AnimationEventEditor
             HandleEventDrag();
             
             GUI.EndScrollView();
-            DrawPreviewWindow(panelRect);
+            currentEvent.mousePosition = savedMousePosition;
+
+            EditorGUI.DrawRect(hintRect, ColBackground);
+            GUI.Label(hintRect,
+                "Ctrl+wheel: zoom | wheel: pan | MMB/Alt+drag: pan | F: frame | arrows: step | Home/End | Ctrl+drag: snap | double-click: add event",
+                previewHintStyle);
+
+            if (previewVisible) DrawPreviewPane(previewRect);
         }
 
-        private void DrawPreviewWindow(Rect fullPanel)
+        private float ContentWidth(float viewWidth) =>
+            Mathf.Max(frameCount * FrameWidth + TimelineBorder * 2f + 20f, viewWidth + 1f);
+
+        private void ClampScroll()
         {
-            if (previewClip == null) return;
-            
-            float previewW = 240f;
-            float previewH = 240f;
-            // bottom right corner:
-            Rect previewRect = new Rect(
-                fullPanel.width - previewW - 12f,
-                fullPanel.height - previewH - 18f,
-                previewW, previewH);
-            EditorGUI.DrawRect(previewRect, new Color(0f, 0f, 0f, 0.75f));
-            // GUI.BeginGroup(previewRect);
-            // GUILayout.Label($"Preview: {previewClip.name}", EditorStyles.whiteMiniLabel);
-            RenderPreviewScene(previewRect);
-            
-            var bottomLabelRect = new Rect(previewRect.x + 4f, previewRect.yMax - 18f, previewRect.width - 8f, 16f);
-            
-            if (selectedEventIndex >= 0) 
-                GUI.Label(bottomLabelRect, $"preview at {currentTimeScrubberTime}ms", EditorStyles.whiteMiniLabel);
-            // GUI.EndGroup();
+            float maxX = Mathf.Max(0f, ContentWidth(timelineViewWidth) - timelineViewWidth);
+            timelineScroll.x = Mathf.Clamp(timelineScroll.x, 0f, maxX);
+            timelineScroll.y = Mathf.Max(0f, timelineScroll.y);
         }
-        
+
+        private void SetZoom(float newZoom, float anchorViewX)
+        {
+            newZoom = Mathf.Clamp(newZoom, MinZoom, MaxZoom);
+            if (Mathf.Approximately(newZoom, zoom)) return;
+
+            float anchorTime = XToTime(anchorViewX + timelineScroll.x);
+            zoom = newZoom;
+            timelineScroll.x = TimeToX(anchorTime) - anchorViewX;
+            ClampScroll();
+            Repaint();
+        }
+
+        private void FrameRange(float startTime, float endTime)
+        {
+            float span = endTime - startTime;
+            if (frameRate <= 0f || span <= 0f)
+            {
+                zoom = 1f;
+                timelineScroll.x = 0f;
+                return;
+            }
+
+            float availableWidth = Mathf.Max(50f, timelineViewWidth - TimelineBorder * 2f);
+            zoom = Mathf.Clamp(availableWidth / (span * frameRate) / BaseFrameWidth, MinZoom, MaxZoom);
+            timelineScroll.x = TimeToX(startTime) - TimelineBorder;
+            ClampScroll();
+            Repaint();
+        }
+
+        private void FrameSelection()
+        {
+            if (selectedEventIndex >= 0 && selectedEventIndex < workingEvents.Count && frameRate > 0f)
+            {
+                float time = workingEvents[selectedEventIndex].time;
+                float halfSpan = 15f / frameRate;
+                FrameRange(time - halfSpan, time + halfSpan);
+            }
+            else FrameRange(0f, clipLength);
+        }
+
+        private void EnsureTimeVisible(float time)
+        {
+            if (timelineViewWidth <= 0f) return;
+
+            const float margin = 24f;
+            float x = TimeToX(time);
+            if (x < timelineScroll.x + margin) timelineScroll.x = x - margin;
+            else if (x > timelineScroll.x + timelineViewWidth - margin)
+                timelineScroll.x = x - timelineViewWidth + margin;
+            ClampScroll();
+        }
+
+        private void SetScrubberTime(float time)
+        {
+            previewPlaying = false;
+            currentTimeScrubberTime = Mathf.Clamp(time, 0f, clipLength);
+            EnsureTimeVisible(currentTimeScrubberTime);
+            Repaint();
+        }
+
+        private void HandleTimelineInput(Rect viewRect, bool canScrollVertically)
+        {
+            Event e = Event.current;
+            bool inView = viewRect.Contains(e.mousePosition);
+
+            switch (e.type)
+            {
+                case EventType.ScrollWheel when inView:
+                    if (e.control || e.command)
+                    {
+                        SetZoom(zoom * Mathf.Exp(-e.delta.y * 0.05f), e.mousePosition.x - viewRect.x);
+                        e.Use();
+                    }
+                    else if (!canScrollVertically)
+                    {
+                        timelineScroll.x += (e.delta.y + e.delta.x) * 20f;
+                        ClampScroll();
+                        e.Use();
+                        Repaint();
+                    }
+                    break;
+                case EventType.MouseDown when inView && (e.button == 2 || (e.button == 0 && e.alt)):
+                    isPanning = true;
+                    e.Use();
+                    break;
+                case EventType.MouseDrag when isPanning:
+                    timelineScroll.x -= e.delta.x;
+                    timelineScroll.y -= e.delta.y;
+                    ClampScroll();
+                    e.Use();
+                    Repaint();
+                    break;
+                case EventType.MouseUp when isPanning:
+                    isPanning = false;
+                    e.Use();
+                    break;
+                case EventType.KeyDown when !EditorGUIUtility.editingTextField:
+                    HandleTimelineKeys(e);
+                    break;
+                case EventType.Repaint when isScrubberDragging || isDraggingEvent:
+                    AutoScrollWhileDragging();
+                    break;
+            }
+        }
+
+        private void HandleTimelineKeys(Event e)
+        {
+            switch (e.keyCode)
+            {
+                case KeyCode.F:
+                    FrameSelection();
+                    e.Use();
+                    break;
+                case KeyCode.LeftArrow:
+                    SetScrubberTime(FrameToTime(TimeToFrame(currentTimeScrubberTime) - (e.shift ? 10 : 1)));
+                    e.Use();
+                    break;
+                case KeyCode.RightArrow:
+                    SetScrubberTime(FrameToTime(TimeToFrame(currentTimeScrubberTime) + (e.shift ? 10 : 1)));
+                    e.Use();
+                    break;
+                case KeyCode.Home:
+                    SetScrubberTime(0f);
+                    e.Use();
+                    break;
+                case KeyCode.End:
+                    SetScrubberTime(clipLength);
+                    e.Use();
+                    break;
+            }
+        }
+
+        private void AutoScrollWhileDragging()
+        {
+            const float edge = 24f;
+            float deltaX = 0f;
+            if (lastDragViewX < edge) deltaX = lastDragViewX - edge;
+            else if (lastDragViewX > timelineViewWidth - edge)
+                deltaX = lastDragViewX - (timelineViewWidth - edge);
+            if (deltaX == 0f) return;
+
+            float previousScroll = timelineScroll.x;
+            timelineScroll.x += Mathf.Clamp(deltaX * 0.5f, -30f, 30f);
+            ClampScroll();
+            if (Mathf.Approximately(previousScroll, timelineScroll.x)) return;
+
+            ApplyDragTime(lastDragViewX + timelineScroll.x);
+            Repaint();
+        }
+
+        private void HandlePreviewResizeGrip(Rect rect)
+        {
+            Rect grip = new(rect.x, rect.y, PreviewGripSize, PreviewGripSize);
+            for (int i = 0; i < 3; i++)
+                EditorGUI.DrawRect(new Rect(rect.x + 2f + i * 3f, rect.y + 9f - i * 3f, 2f, 2f),
+                    new Color(1f, 1f, 1f, 0.5f));
+            EditorGUIUtility.AddCursorRect(grip, MouseCursor.ResizeUpLeft);
+
+            int id = GUIUtility.GetControlID(FocusType.Passive);
+            Event e = Event.current;
+            switch (e.GetTypeForControl(id))
+            {
+                case EventType.MouseDown when e.button == 0 && grip.Contains(e.mousePosition):
+                    GUIUtility.hotControl = id;
+                    e.Use();
+                    break;
+                case EventType.MouseDrag when GUIUtility.hotControl == id:
+                    previewSize = Mathf.Max(MinPreviewSize,
+                        Mathf.Max(rect.xMax - e.mousePosition.x, rect.yMax - e.mousePosition.y));
+                    e.Use();
+                    Repaint();
+                    break;
+                case EventType.MouseUp when GUIUtility.hotControl == id:
+                    GUIUtility.hotControl = 0;
+                    EditorPrefs.SetFloat(PrefPreviewSize, previewSize);
+                    e.Use();
+                    break;
+            }
+        }
+
+        private void DrawPreviewPane(Rect rect)
+        {
+            EditorGUI.DrawRect(rect, new Color(0.1f, 0.1f, 0.1f));
+            if (previewClip == null || _previewUtility == null || previewSceneObject == null)
+            {
+                GUI.Label(rect, previewClip == null ? "No preview clip." : "Preview unavailable.",
+                    EditorStyles.centeredGreyMiniLabel);
+                return;
+            }
+
+            RenderPreviewScene(rect);
+            HandlePreviewResizeGrip(rect);
+
+            float x = rect.x + PreviewGripSize + 4f;
+            float y = rect.y + 4f;
+            if (GUI.Button(new Rect(x, y, 44, 18), previewPlaying ? "Pause" : "Play", EditorStyles.miniButton))
+                TogglePreviewPlay();
+            x += 48f;
+            previewLoop = GUI.Toggle(new Rect(x, y, 44, 18), previewLoop, "Loop", EditorStyles.miniButton);
+            x += 48f;
+            if (GUI.Button(new Rect(x, y, 48, 18), new GUIContent("Reset", "Reset camera (or double-click)"),
+                    EditorStyles.miniButton)) ResetPreviewCamera();
+
+            GUI.Label(new Rect(rect.x + 6f, rect.yMax - 18f, rect.width * 0.4f, 16f),
+                $"{currentTimeScrubberTime:F3}s  f{TimeToFrame(currentTimeScrubberTime)}", EditorStyles.whiteMiniLabel);
+            GUI.Label(new Rect(rect.xMax - rect.width * 0.6f - 6f, rect.yMax - 18f, rect.width * 0.6f, 16f),
+                "drag: rotate  wheel: zoom", previewHintStyle);
+
+            int id = GUIUtility.GetControlID(FocusType.Passive);
+            Event e = Event.current;
+            EditorGUIUtility.AddCursorRect(rect, MouseCursor.Orbit);
+            switch (e.GetTypeForControl(id))
+            {
+                case EventType.MouseDown when e.button == 0 && rect.Contains(e.mousePosition):
+                    if (e.clickCount == 2) ResetPreviewCamera();
+                    else GUIUtility.hotControl = id;
+                    e.Use();
+                    break;
+                case EventType.MouseDrag when GUIUtility.hotControl == id:
+                    previewYaw += e.delta.x * 0.5f;
+                    previewPitch = Mathf.Clamp(previewPitch + e.delta.y * 0.5f, -80f, 80f);
+                    e.Use();
+                    Repaint();
+                    break;
+                case EventType.MouseUp when GUIUtility.hotControl == id:
+                    GUIUtility.hotControl = 0;
+                    e.Use();
+                    break;
+                case EventType.ScrollWheel when rect.Contains(e.mousePosition):
+                    previewZoom = Mathf.Clamp(previewZoom * Mathf.Exp(e.delta.y * 0.05f), 0.1f, 5f);
+                    e.Use();
+                    Repaint();
+                    break;
+            }
+        }
+
+        private void TogglePreviewPlay()
+        {
+            previewPlaying = !previewPlaying;
+            if (previewPlaying)
+            {
+                if (currentTimeScrubberTime >= clipLength - 0.0001f) currentTimeScrubberTime = 0f;
+                lastUpdateTime = EditorApplication.timeSinceStartup;
+            }
+        }
+
         private void RenderPreviewScene(Rect rect)
         {
+            if (Event.current.type != EventType.Repaint) return;
             if (previewSceneObject == null) return;
             if (_previewUtility == null) return;
             _previewUtility.BeginPreview(rect, GUIStyle.none);
             previewClip.SampleAnimation(previewSceneObject, currentTimeScrubberTime);
+            UpdatePreviewCamera(rect.width / Mathf.Max(1f, rect.height));
             _previewUtility.camera.Render();
             Texture resultTexture = _previewUtility.EndPreview();
             GUI.DrawTexture(rect, resultTexture, ScaleMode.StretchToFill, false);
@@ -1144,10 +1511,24 @@ namespace AnimationEventEditor
         {
             if (frameCount <= 0 || frameRate <= 0) return;
 
-            int step = Mathf.Max(1, Mathf.CeilToInt(36f / FrameWidth));
+            int step = NiceTickSteps[NiceTickSteps.Length - 1];
+            foreach (int candidate in NiceTickSteps)
+            {
+                if (candidate * FrameWidth >= 36f)
+                {
+                    step = candidate;
+                    break;
+                }
+            }
             float gridH = totalContentH > 0 ? totalContentH : TickRowHeight;
+            bool drawMinor = FrameWidth >= 3f;
 
-            for (int f = 0; f <= frameCount; f++)
+            int firstFrame = Mathf.Clamp(Mathf.FloorToInt((timelineScroll.x - TimelineBorder) / FrameWidth) - 1,
+                0, frameCount);
+            int lastFrame = Mathf.Clamp(Mathf.CeilToInt((timelineScroll.x + timelineViewWidth - TimelineBorder) / FrameWidth) + 1,
+                0, frameCount);
+
+            for (int f = firstFrame; f <= lastFrame; f++)
             {
                 float x      = TimelineBorder + f * FrameWidth;
                 bool  isMajor = f % step == 0;
@@ -1162,7 +1543,7 @@ namespace AnimationEventEditor
                     EditorGUI.LabelField(
                         new Rect(x + 2, 2, 40, 14), f.ToString(), EditorStyles.miniLabel);
                 }
-                else
+                else if (drawMinor)
                 {
                     EditorGUI.DrawRect(new Rect(x, TickRowHeight - 7, 1f, 7f), ColTickMinor);
                 }
@@ -1322,11 +1703,16 @@ namespace AnimationEventEditor
             
             // EditorGUI.DrawRect(new Rect(0, 0, panelRect.width, TickRowHeight), ColTimeScrubberNormal);
 
-            var timeLineHitRect = new Rect(0, 4, panelRect.width, TickRowHeight - 8);
-            if (Event.current.type == EventType.MouseDown && timeLineHitRect.Contains(Event.current.mousePosition))
+            var timeLineHitRect = new Rect(0, 4, timelineContentW, TickRowHeight - 8);
+            if (Event.current.type == EventType.MouseDown && Event.current.button == 0
+                && !Event.current.alt && timeLineHitRect.Contains(Event.current.mousePosition))
             {
                 isScrubberDragging = true;
+                previewPlaying = false;
                 GUI.FocusControl(null);
+                lastDragViewX = Event.current.mousePosition.x - timelineScroll.x;
+                lastDragSnap = Event.current.control;
+                ApplyDragTime(Event.current.mousePosition.x);
                 Event.current.Use();
                 Repaint();
             }
@@ -1385,6 +1771,10 @@ namespace AnimationEventEditor
                 selectedEventIndex = index;
                 isDraggingEvent    = true;
                 dragEventIndex     = index;
+                previewPlaying     = false;
+                lastDragViewX      = Event.current.mousePosition.x - timelineScroll.x;
+                lastDragSnap       = Event.current.control;
+                EnsureTimeVisible(evt.time);
                 GUI.FocusControl(null);
                 Event.current.Use();
                 Repaint();
@@ -1410,44 +1800,40 @@ namespace AnimationEventEditor
 
         private void HandleEventDrag()
         {
-            if (isDraggingEvent && dragEventIndex >= 0 && dragEventIndex < workingEvents.Count)
+            Event e = Event.current;
+
+            if (e.type == EventType.MouseDrag && (isDraggingEvent || isScrubberDragging))
             {
-                if (Event.current.type == EventType.MouseDrag)
-                {
-                    // snap to frame:
-                    float newTime = XToTime(Event.current.mousePosition.x);
-                    newTime = Mathf.Clamp(newTime, 0f, clipLength > 0 ? clipLength : float.MaxValue);
-                    if (Event.current.modifiers == EventModifiers.Control)
-                        newTime = FrameToTime(TimeToFrame(newTime));
-                    workingEvents[dragEventIndex].time = newTime;
-                    currentTimeScrubberTime = workingEvents[dragEventIndex].time;
-                    isDirty = true;
-                    Event.current.Use();
-                    Repaint();
-                }
+                lastDragViewX = e.mousePosition.x - timelineScroll.x;
+                lastDragSnap = e.control;
+                ApplyDragTime(e.mousePosition.x);
+                e.Use();
+                Repaint();
             }
 
-            if (isScrubberDragging)
-            {
-                if (Event.current.type == EventType.MouseDrag)
-                {
-                    float newTime = XToTime(Event.current.mousePosition.x);
-                    newTime = Mathf.Clamp(newTime, 0f, clipLength > 0 ? clipLength : float.MaxValue);
-                    if (Event.current.modifiers == EventModifiers.Control)
-                        newTime = FrameToTime(TimeToFrame(newTime));
-                    currentTimeScrubberTime = newTime;
-                    isDirty = true;
-                    Event.current.Use();
-                    Repaint();
-                }
-            }
-            
-            if (Event.current.type == EventType.MouseUp)
+            if (e.type == EventType.MouseUp && (isDraggingEvent || isScrubberDragging))
             {
                 isScrubberDragging = false;
                 isDraggingEvent = false;
                 dragEventIndex = -1;
-                Event.current.Use();
+                e.Use();
+            }
+        }
+
+        private void ApplyDragTime(float contentX)
+        {
+            float time = Mathf.Clamp(XToTime(contentX), 0f, clipLength > 0 ? clipLength : float.MaxValue);
+            if (lastDragSnap) time = FrameToTime(TimeToFrame(time));
+
+            if (isDraggingEvent && dragEventIndex >= 0 && dragEventIndex < workingEvents.Count)
+            {
+                workingEvents[dragEventIndex].time = time;
+                currentTimeScrubberTime = time;
+                isDirty = true;
+            }
+            else if (isScrubberDragging)
+            {
+                currentTimeScrubberTime = time;
             }
         }
 
@@ -1500,16 +1886,6 @@ namespace AnimationEventEditor
         
         private int TimeToFrame(float time) => Mathf.Clamp(Mathf.RoundToInt(time * frameRate), 0, frameCount);
         private float FrameToTime(int frame) => frameRate > 0 ? frame / frameRate : 0f;
-
-        private void FitZoom(float panelWidth)
-        {
-            if (frameCount <= 0 || frameRate <= 0) { zoom = 1f; return; }
-
-            float availableW = panelWidth - TimelineBorder * 2f;
-            float rawFrameW  = availableW / frameCount;
-            zoom = Mathf.Clamp(rawFrameW / 14f, 0.1f, 8f);
-            timelineScroll.x = 0;
-        }
 
         // --- Favorites panel ------------------------------------------------------
         private void DrawFavoritesPanel()
